@@ -90,6 +90,7 @@ class OurArguments(TrainingArguments):
     kfac_cache_E: bool = True  # materialize E once per step (+1x param memory) instead of regenerating 4x
     kfac_spectra_file: str = None  # where to write the factor spectra JSON (first calibration); default <output_dir>/kfac_spectra.json
     kfac_eigh_fp64: bool = True  # eigendecompose blocks in fp64
+    kfac_scope: str = "all"  # which parameters are perturbed and updated: all | weights (K-FAC'd weights only) | rest (embeddings, positions, 1-D only)
     kfac_pg_decomp: int = 0  # if >0: on the first N steps split the directional derivative by parameter subset (diagnostic, 6 extra forwards)
     kfac_check_restore: int = 0  # if >0: on the first N steps record max|W_after_restore - W_before| (diagnostic)
 
@@ -887,7 +888,7 @@ def main():
                     "max_steps", "per_device_train_batch_size", "seed", "train_set_seed", "num_train", "num_dev", "num_eval",
                     "load_float16", "load_bfloat16", "weight_decay", "zo_optimizer", "rank_r", "step_interval", "multiple_sample",
                     "num_samples", "hessian_smooth_type", "kfac_placement", "kfac_power", "kfac_damping", "kfac_block",
-                    "kfac_calib_steps", "kfac_fisher", "kfac_refresh", "loren_num_queries", "loren_damping", "loren_lr_cov",
+                    "kfac_calib_steps", "kfac_fisher", "kfac_refresh", "kfac_scope", "loren_num_queries", "loren_damping", "loren_lr_cov",
                     "loren_weight_decay", "slice_logits", "tag"]}
                 _here = os.path.dirname(os.path.abspath(__file__))
                 metrics["git_commit"] = os.popen(f"git -C {_here} rev-parse HEAD 2>/dev/null").read().strip()

@@ -103,7 +103,11 @@ class KFACMeZOTrainer(MeZOTrainer):
         self.pg_abs = []
         self.pg_decomp = []
         self._E = None
-        self.kfac_identity = (args.kfac_power == 0.0)
+        assert args.kfac_scope in ("all", "weights", "rest"), args.kfac_scope
+        assert args.kfac_scope == "all" or args.kfac_cache_E, "kfac_scope needs the cached E"
+        # scope=rest perturbs no K-FAC'd weight, so it needs no factors
+        self.kfac_identity = (args.kfac_power == 0.0 or args.kfac_scope == "rest")
+        self._kfac_names = None
 
     # ------------------------------------------------------------------ factor estimation
     def _target_linears(self, model):
@@ -395,9 +399,13 @@ class KFACMeZOTrainer(MeZOTrainer):
         """z for every param in MeZO order from the step seed; transformed (placement A) for K-FAC'd weights."""
         torch.manual_seed(self.zo_random_seed)
         out = []
+        scope = self.args.kfac_scope
         for name, param in self.named_parameters_to_optim:
+            # always drawn, so the RNG stream does not depend on the scope; None = this parameter is frozen for this run
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-            if self.args.kfac_placement == "A" and not self.kfac_identity and name in self.kfac:
+            if scope != "all" and (name in self._kfac_names) != (scope == "weights"):
+                z = None
+            elif self.args.kfac_placement == "A" and not self.kfac_identity and name in self.kfac:
                 z = self._transform(name, z)
             out.append(z)
         return out
@@ -451,6 +459,8 @@ class KFACMeZOTrainer(MeZOTrainer):
         assert random_seed is None
         if self._E is not None:
             for (name, param), E in zip(self.named_parameters_to_optim, self._E):
+                if E is None:
+                    continue
                 param.data = param.data + scaling_factor * E * self.args.zo_eps  # same expression as MeZO
         else:
             torch.manual_seed(self.zo_random_seed)
@@ -463,6 +473,8 @@ class KFACMeZOTrainer(MeZOTrainer):
     def zo_step(self, model, inputs):
         self._maybe_calibrate(model)
         self.named_parameters_to_optim = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        if self._kfac_names is None:
+            self._kfac_names = {n + ".weight" for n in self._target_linears(model)}
         self.zo_random_seed = np.random.randint(1000000000)
         snap = None
         if self.args.kfac_check_restore > 0 and len(self.restore_checks) < self.args.kfac_check_restore:
@@ -505,6 +517,8 @@ class KFACMeZOTrainer(MeZOTrainer):
         else:
             Es = self._draw()
         for (name, param), z in zip(self.named_parameters_to_optim, Es):
+            if z is None:
+                continue
             if args.kfac_placement == "B" and not self.kfac_identity and name in self.kfac:
                 z = self._transform(name, z)
             if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
@@ -517,7 +531,7 @@ class KFACMeZOTrainer(MeZOTrainer):
     # ------------------------------------------------------------------ reporting
     def extra_results(self):
         a = self.args
-        return {"kfac_placement": a.kfac_placement, "kfac_power": a.kfac_power, "kfac_damping": a.kfac_damping,
+        return {"kfac_scope": a.kfac_scope, "kfac_placement": a.kfac_placement, "kfac_power": a.kfac_power, "kfac_damping": a.kfac_damping,
                 "kfac_fisher": a.kfac_fisher, "kfac_block": a.kfac_block, "kfac_refresh": a.kfac_refresh,
                 "kfac_backprop_examples": self.kfac_backprop_examples,
                 "kfac_backprop_passes": self.kfac_backprop_passes,
