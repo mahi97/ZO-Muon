@@ -1,4 +1,4 @@
-MODEL=${MODEL:-opt-13b}
+MODEL=${MODEL:-facebook/opt-13b}  # [inverse-metric] was "opt-13b" (no org prefix)
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
@@ -15,7 +15,7 @@ WARMUP_STEP=${WARMUP_STEP:-0}
 DECAY_STEP=${DECAY_STEP:-0}
 ZO_LR_SCHEDULER_TYPE=${ZO_LR_SCHEDULER_TYPE:-'constant'}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0}
-HESSIAN_SMOOTH_TYPE=${HESSIAN_SMOOTH_TYPE:-'constant0'}
+HESSIAN_SMOOTH_TYPE=${HESSIAN_SMOOTH_TYPE:-constant1e-8}  # [inverse-metric] README value; script default constant0 never updates the Hessian (== MeZO + 1 extra forward)
 LOAD_MODE=${LOAD_MODE:-float16} 
 MAX_TIME=${MAX_TIME:-0}
 
@@ -69,16 +69,16 @@ echo "TRAIN/EVAL STEPS: $STEPS/$EVAL_STEPS"
 echo "MODE: $MODE"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 
-python ../run.py \
+python "$(dirname "$0")/../run.py" \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --seed $SEED --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
     --max_steps $STEPS \
     --trainer $Tainer \
     --max_time $MAX_TIME \
     $LOAD_FLAG \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
-    --load_best_model_at_end --evaluation_strategy steps --save_strategy steps --save_total_limit 1 \
+    --evaluation_strategy steps --save_strategy no --report_to ${REPORT_TO:-wandb} --run_name ${RUN_NAME:-$TAG} \
     --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \
     --warmup_step $WARMUP_STEP --decay_step $DECAY_STEP  --zo_lr_scheduler_type $ZO_LR_SCHEDULER_TYPE \
     --weight_decay $WEIGHT_DECAY --hessian_smooth_type $HESSIAN_SMOOTH_TYPE \

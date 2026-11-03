@@ -24,7 +24,7 @@ if [ "$MODE" == "prefix" ]; then
 elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
-SEED=0
+SEED=${SEED:-0}  # [inverse-metric] was hard-coded SEED=0
 Tainer=lozo
 
 
@@ -74,10 +74,10 @@ echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 echo "RANK: $RANK"
 echo "STEP INTERVAL: $STEP_INTERVAL"
 
-python ../run.py \
+python "$(dirname "$0")/../run.py" \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --seed $SEED --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
     --max_steps $STEPS \
     --trainer $Tainer \
     $LOAD_FLAG \
@@ -85,7 +85,7 @@ python ../run.py \
     --adam_eps 1e-6 \
     --max_time $MAX_TIME \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
-    --load_best_model_at_end --evaluation_strategy steps --save_strategy steps --save_total_limit 1 \
+    --evaluation_strategy steps --save_strategy no --report_to ${REPORT_TO:-wandb} --run_name ${RUN_NAME:-$TAG} \
     --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \
     --train_as_classification \
     --step_interval $STEP_INTERVAL \

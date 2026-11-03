@@ -26,6 +26,7 @@ from MeZOTrainer import MeZOTrainer
 from LowDimTrainer import LowDimTrainer
 from LOZOTrainer import LOZOTrainer
 from SubZeroTrainer import SubZeroTrainer
+from KFACMeZOTrainer import KFACMeZOTrainer
 from transformers import (
     TrainerCallback, 
     TrainerControl, 
@@ -65,6 +66,31 @@ class OurArguments(TrainingArguments):
     step_interval: int = 50 
     rank_r: int = 2 
     sparsity: float=1.0
+    # [inverse-metric] Flags passed by the released subzero.sh / lowdim.sh that were not defined here
+    # (the scripts crashed in HfArgumentParser). Accepted and IGNORED: no trainer reads them.
+    reduce_rank: bool = False
+    truncation_rank: int = 2
+    switch_optim: bool = False
+    threshold: int = 15000
+    compute_variance: bool = False
+
+    # [inverse-metric] K-FAC-shaped MeZO (KFACMeZOTrainer, trainer=kfac_mezo)
+    kfac_placement: str = "A"  # "A": perturb with E = c*G^p Z A^p (cov = c^2 K^{2p}); "B": isotropic perturb, update with c^2 G^{2p} (g z) A^{2p}
+    kfac_power: float = -0.5  # p. -0.5 => cov K-FAC^-1; -0.25 => K-FAC^-1/2; +0.5 => K-FAC^+1; 0 => isotropic (bit-identical MeZO)
+    kfac_damping: float = 1e-3  # damping gamma, relative: lambda += gamma * mean(lambda) per factor
+    kfac_block: int = 512  # block-diagonal block size for A and G
+    kfac_calib_steps: int = 200  # backprop minibatches per calibration
+    kfac_calib_bs: int = 16  # examples per calibration minibatch
+    kfac_calib_microbs: int = 16  # examples per backward pass (memory; exact accumulation)
+    kfac_fisher: str = "true"  # "true": labels sampled from the model's predictive distribution; "empirical": gold labels
+    kfac_refresh: int = 2000  # recompute factors every N ZO steps (0 = never)
+    kfac_cache_E: bool = True  # materialize E once per step (+1x param memory) instead of regenerating 4x
+    kfac_spectra_file: str = None  # where to write the factor spectra JSON (first calibration); default <output_dir>/kfac_spectra.json
+    kfac_eigh_fp64: bool = True  # eigendecompose blocks in fp64
+    kfac_check_restore: int = 0  # if >0: on the first N steps record max|W_after_restore - W_before| (diagnostic)
+
+    # [inverse-metric] periodic accuracy eval (dev + test) every N steps, logged to W&B (0 = off)
+    acc_eval_steps: int = 0
     # Training
     trainer: str = "none" 
     ## options
@@ -156,6 +182,69 @@ class MaxTimeCallback(TrainerCallback):
             control.should_training_stop = True # <--- THIS WAS MISSING OR IMPLIED
             return control
 
+
+
+class StepTimerCallback(TrainerCallback):
+    """[inverse-metric] wall-clock per ZO step (CUDA-synchronized) and peak memory."""
+    def __init__(self, skip=5):
+        self.skip = skip
+        self.times = []
+        self._t = None
+    def on_step_begin(self, args, state, control, **kwargs):
+        torch.cuda.synchronize()
+        self._t = time.time()
+    def on_step_end(self, args, state, control, **kwargs):
+        torch.cuda.synchronize()
+        if self._t is not None:
+            dt = time.time() - self._t
+            tr = getattr(self, "trainer", None)  # exclude K-FAC calibration time (reported separately)
+            if tr is not None and getattr(tr, "_calib_seconds_pending", 0.0) > 0:
+                dt -= tr._calib_seconds_pending
+                tr._calib_seconds_pending = 0.0
+            self.times.append(dt)
+        if state.global_step % 100 == 0 and len(self.times) > self.skip:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({"perf/s_per_step": float(np.mean(self.times[-100:])),
+                               "perf/peak_mem_GB": torch.cuda.max_memory_allocated() / 2**30,
+                               "train/global_step": state.global_step}, step=state.global_step)
+            except Exception:
+                pass
+    def summary(self):
+        t = np.array(self.times[self.skip:]) if len(self.times) > self.skip else np.array(self.times)
+        out = {"n_steps_timed": int(len(t))}
+        if len(t):
+            out.update({"s_per_step_mean": float(t.mean()), "s_per_step_median": float(np.median(t))})
+        out["peak_mem_allocated_GB"] = torch.cuda.max_memory_allocated() / 2**30
+        out["peak_mem_reserved_GB"] = torch.cuda.max_memory_reserved() / 2**30
+        return out
+
+
+class AccEvalCallback(TrainerCallback):
+    """[inverse-metric] dev/test accuracy every N steps (same evaluate() as the final eval), logged to W&B."""
+    def __init__(self, framework, dev_samples, test_samples, every):
+        self.fw, self.dev, self.test, self.every = framework, dev_samples, test_samples, every
+        self.history = []
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.every != 0 or state.global_step == state.max_steps:
+            return
+        rng = (random.getstate(), np.random.get_state(), torch.random.get_rng_state(), torch.cuda.get_rng_state_all())
+        rec = {"step": state.global_step}
+        if self.dev is not None:
+            rec["dev_accuracy"] = self.fw.evaluate([], self.dev).get("accuracy")
+        if self.test is not None:
+            rec["test_accuracy"] = self.fw.evaluate([], self.test).get("accuracy")
+        random.setstate(rng[0]); np.random.set_state(rng[1]); torch.random.set_rng_state(rng[2]); torch.cuda.set_rng_state_all(rng[3])
+        self.history.append(rec)
+        logger.info(f"[acc_eval] {rec}")
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({"eval/dev_acc": rec.get("dev_accuracy"), "eval/test_acc": rec.get("test_accuracy"),
+                           "train/global_step": state.global_step}, step=state.global_step)
+        except Exception:
+            pass
 
 
 from transformers import Trainer
@@ -501,6 +590,15 @@ class Framework:
                 tokenizer=self.tokenizer,
                 data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
             )
+        elif self.args.trainer=="kfac_mezo":
+            trainer = KFACMeZOTrainer(
+                model=self.model,
+                args=self.args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                tokenizer=self.tokenizer,
+                data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
+            )
         elif self.args.trainer=="subzero":
             trainer = SubZeroTrainer(
                 model=self.model, 
@@ -522,6 +620,20 @@ class Framework:
             )
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
+
+        # [inverse-metric] The ZO trainers call self._save_checkpoint directly at every eval (best_eval_loss is
+        # never updated), writing a full checkpoint each time. With --save_strategy no we disable that.
+        if str(self.args.save_strategy) in ("no", "IntervalStrategy.NO", "SaveStrategy.NO"):
+            trainer._save_checkpoint = lambda *a, **k: None
+            logger.info("[inverse-metric] save_strategy=no: checkpoint saving disabled")
+
+        # [inverse-metric] step timing + peak memory, and optional periodic accuracy eval
+        self.step_timer = StepTimerCallback()
+        self.step_timer.trainer = trainer
+        trainer.add_callback(self.step_timer)
+        if self.args.acc_eval_steps > 0:
+            trainer.add_callback(AccEvalCallback(self, eval_samples, getattr(self, "test_samples", None), self.args.acc_eval_steps))
+        self.trainer = trainer
         
         # ==========================================
         # NEW: Inject MaxTimeCallback if requested
@@ -649,8 +761,36 @@ import logging
 # If logger is not defined globally, you might need to initialize it. 
 # For this snippet, I assume 'logger' is available as per your original code.
 
+def log_final_to_wandb(metrics, args):
+    """[inverse-metric] final test/dev accuracy -> W&B (run summary + one log row). No-op if W&B is off."""
+    if "wandb" not in str(args.report_to):
+        return
+    try:
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is None:
+        wandb.init(project=os.environ.get("WANDB_PROJECT", "inverse-metric-es"), name=args.run_name, config=metrics.get("config"))
+    flat = {}
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            flat["final/" + ("test_" + k if k == "accuracy" or k == "f1" else k)] = v
+    wandb.log(flat)
+    for k, v in flat.items():
+        wandb.run.summary[k] = v
+    wandb.config.update(metrics.get("config", {}), allow_val_change=True)
+    wandb.finish()
+
+
 def main():
     args = parse_args()
+
+    # [inverse-metric] hard per-process GPU memory cap (allocator only; the CUDA context adds ~0.3-0.5 GB) for shared GPUs
+    cap_gb = float(os.environ.get("P3A_GPU_MEM_CAP_GB", 0))
+    if cap_gb > 0:
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+        torch.cuda.set_per_process_memory_fraction(cap_gb / total_gb, 0)
+        logger.info(f"[inverse-metric] GPU memory cap {cap_gb} GB of {total_gb:.1f} GB")
 
     set_seed(args.seed)
     task = get_task(args.task_name)
@@ -683,6 +823,7 @@ def main():
 
                 # Training
                 logger.info(f"Starting training for set {train_set_id}...")
+                framework.test_samples = eval_samples  # [inverse-metric] for the optional periodic acc eval
                 train_start_time = time.time()
                 
                 framework.train(train_samples, dev_samples if dev_samples is not None else eval_samples)
@@ -703,10 +844,36 @@ def main():
                 metrics = framework.evaluate(train_samples, eval_samples)
 
             if not args.no_eval:
+                # [inverse-metric] provenance, timing, memory, method-specific extras (e.g. K-FAC backprop count)
+                if args.trainer != "none":
+                    metrics["train_seconds"] = train_duration
+                    if getattr(framework, "step_timer", None) is not None:
+                        metrics.update({"perf_" + k: v for k, v in framework.step_timer.summary().items()})
+                    tr = getattr(framework, "trainer", None)
+                    with torch.no_grad():  # fingerprint of the final weights (bit-identity checks between trainers)
+                        metrics["param_checksum"] = float(sum(p.double().sum().item() for p in framework.model.parameters()))
+                        metrics["param_abs_checksum"] = float(sum(p.double().abs().sum().item() for p in framework.model.parameters()))
+                    if tr is not None and hasattr(tr, "extra_results"):
+                        metrics.update(tr.extra_results())
+                    for cb in (tr.callback_handler.callbacks if tr is not None else []):
+                        if isinstance(cb, AccEvalCallback):
+                            metrics["acc_history"] = cb.history
+                metrics["config"] = {k: getattr(args, k) for k in ["task_name", "model_name", "trainer", "learning_rate", "zo_eps",
+                    "max_steps", "per_device_train_batch_size", "seed", "train_set_seed", "num_train", "num_dev", "num_eval",
+                    "load_float16", "load_bfloat16", "weight_decay", "zo_optimizer", "rank_r", "step_interval", "multiple_sample",
+                    "num_samples", "hessian_smooth_type", "kfac_placement", "kfac_power", "kfac_damping", "kfac_block",
+                    "kfac_calib_steps", "kfac_fisher", "kfac_refresh", "tag"]}
+                _here = os.path.dirname(os.path.abspath(__file__))
+                metrics["git_commit"] = os.popen(f"git -C {_here} rev-parse HEAD 2>/dev/null").read().strip()
+                metrics["git_dirty"] = bool(os.popen(f"git -C {_here} status --porcelain -- '*.py' 'scripts/*' 2>/dev/null").read().strip())
                 logger.info("===== Train set %d =====" % train_set_seed)
                 logger.info(metrics)
                 if args.local_rank <= 0:
-                    write_metrics_to_file(metrics, "result/" +  result_file_tag(args) + f"-trainset{train_set_id}.json" if args.result_file is None else args.result_file)
+                    rf = "result/" +  result_file_tag(args) + f"-trainset{train_set_id}.json" if args.result_file is None else args.result_file
+                    if os.path.dirname(rf):
+                        os.makedirs(os.path.dirname(rf), exist_ok=True)
+                    write_metrics_to_file(metrics, rf)
+                log_final_to_wandb(metrics, args)
 
     else:
         # For each eval sample, there is a training set. no training is allowed
