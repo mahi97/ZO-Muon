@@ -854,11 +854,13 @@ def main():
                 logger.info(f"Training for set {train_set_id} finished in {train_duration:.2f} seconds.")
 
                 if not args.no_eval:
+                    _t_eval = time.time()
                     metrics = framework.evaluate([], eval_samples) # No in-context learning if there is training
                     if dev_samples is not None:
                         dev_metrics = framework.evaluate([], dev_samples) 
                         for m in dev_metrics:
                             metrics["dev_" + m] = dev_metrics[m]
+                    metrics["final_eval_seconds"] = time.time() - _t_eval
             else:
                 assert args.num_dev is None
                 # Zero-shot / in-context learning
