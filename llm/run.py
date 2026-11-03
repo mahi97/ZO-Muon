@@ -27,6 +27,8 @@ from LowDimTrainer import LowDimTrainer
 from LOZOTrainer import LOZOTrainer
 from SubZeroTrainer import SubZeroTrainer
 from KFACMeZOTrainer import KFACMeZOTrainer
+from ZOAdamTrainer import ZOAdamTrainer
+from LORENTrainer import LORENTrainer
 from transformers import (
     TrainerCallback, 
     TrainerControl, 
@@ -88,6 +90,15 @@ class OurArguments(TrainingArguments):
     kfac_spectra_file: str = None  # where to write the factor spectra JSON (first calibration); default <output_dir>/kfac_spectra.json
     kfac_eigh_fp64: bool = True  # eigendecompose blocks in fp64
     kfac_check_restore: int = 0  # if >0: on the first N steps record max|W_after_restore - W_before| (diagnostic)
+
+    # [inverse-metric] LOREN port (LORENTrainer, trainer=loren); defaults from the released README/main.py
+    loren_num_queries: int = 10  # K; main.py default (the README leaves it unset for LOREN)
+    loren_damping: float = 0.1
+    loren_lr_cov: float = 1e-3
+    loren_weight_decay: float = 0.01  # effective value in the released code, see LORENTrainer.py
+
+    # [inverse-metric] apply lm_head only to the option positions in the training/eval loss (memory; same loss up to rounding)
+    slice_logits: bool = False
 
     # [inverse-metric] periodic accuracy eval (dev + test) every N steps, logged to W&B (0 = off)
     acc_eval_steps: int = 0
@@ -548,6 +559,7 @@ class Framework:
             # If --only_train_option and not with a non-differentiable objective, we wrap the forward function
             self.model.original_forward = self.model.forward
             self.model.forward = forward_wrap_with_option_len.__get__(self.model, type(self.model))
+            self.model._slice_logits = self.args.slice_logits  # [inverse-metric]
         #########################################
 
         if self.args.non_diff:
@@ -586,6 +598,15 @@ class Framework:
                 model=self.model, 
                 args=self.args,
                 train_dataset=train_dataset, 
+                eval_dataset=eval_dataset,
+                tokenizer=self.tokenizer,
+                data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
+            )
+        elif self.args.trainer in ("zo_adam", "loren"):
+            trainer = {"zo_adam": ZOAdamTrainer, "loren": LORENTrainer}[self.args.trainer](
+                model=self.model,
+                args=self.args,
+                train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
                 tokenizer=self.tokenizer,
                 data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
@@ -862,7 +883,8 @@ def main():
                     "max_steps", "per_device_train_batch_size", "seed", "train_set_seed", "num_train", "num_dev", "num_eval",
                     "load_float16", "load_bfloat16", "weight_decay", "zo_optimizer", "rank_r", "step_interval", "multiple_sample",
                     "num_samples", "hessian_smooth_type", "kfac_placement", "kfac_power", "kfac_damping", "kfac_block",
-                    "kfac_calib_steps", "kfac_fisher", "kfac_refresh", "tag"]}
+                    "kfac_calib_steps", "kfac_fisher", "kfac_refresh", "loren_num_queries", "loren_damping", "loren_lr_cov",
+                    "loren_weight_decay", "slice_logits", "tag"]}
                 _here = os.path.dirname(os.path.abspath(__file__))
                 metrics["git_commit"] = os.popen(f"git -C {_here} rev-parse HEAD 2>/dev/null").read().strip()
                 metrics["git_dirty"] = bool(os.popen(f"git -C {_here} status --porcelain -- '*.py' 'scripts/*' 2>/dev/null").read().strip())

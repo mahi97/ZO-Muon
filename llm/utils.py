@@ -28,6 +28,15 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 logger = logging.getLogger(__name__)
 
 
+def option_logits(model, input_ids, attention_mask, option_len):
+    """[inverse-metric] Equals model(...).logits[:, -(L+1):-1], L = max(option_len): the logits predicting the last L tokens.
+    Requires left padding (options right-aligned), which Framework.train sets."""
+    body = model.model.decoder if hasattr(model.model, "decoder") else model.model  # OPT : Qwen2
+    hidden = body(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)[0]
+    L = int(max(option_len))
+    return model.lm_head(hidden[:, -(L + 1):-1, :])
+
+
 def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=None, num_options=None, return_dict=None, **kwargs):
     """
     This is to replace the original forward function of Transformer models to enable:
@@ -41,16 +50,26 @@ def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=N
       words for classification tasks and #choices for multiple choice tasks), and a classification loss
       will be calculated.
     """
-    outputs = self.original_forward(input_ids=input_ids, **kwargs)
-    if labels is None:
-        return outputs
-    logits = outputs.logits
+    if getattr(self, "_slice_logits", False) and labels is not None and option_len is not None:
+        # [inverse-metric] --slice_logits: only the positions that predict option tokens go through lm_head, so logits are
+        # (rows, L, vocab) instead of (rows, T, vocab). Same loss up to rounding (checked in llm/zo/test_kfac.py). Needed
+        # for long-context tasks: full logits plus the log_softmax copy do not fit in 24 GB, see results/p3a_plan.md.
+        logits = option_logits(self, input_ids, kwargs.get("attention_mask"), option_len)
+        outputs = (logits,)
+        return_dict = False
+        shift_logits = logits
+        shift_labels = torch.clone(input_ids)[..., -logits.size(1):].contiguous()
+    else:
+        outputs = self.original_forward(input_ids=input_ids, **kwargs)
+        if labels is None:
+            return outputs
+        logits = outputs.logits
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        # Here we use input_ids (which should always = labels) bc sometimes labels are correct candidate IDs
+        shift_labels = torch.clone(input_ids)[..., 1:].contiguous()
 
     loss = None
-    # Shift so that tokens < n predict n
-    shift_logits = logits[..., :-1, :].contiguous()
-    # Here we use input_ids (which should always = labels) bc sometimes labels are correct candidate IDs
-    shift_labels = torch.clone(input_ids)[..., 1:].contiguous()
     shift_labels[shift_labels == self.config.pad_token_id] = -100
 
     # Apply option len (do not calculate loss on the non-option part)

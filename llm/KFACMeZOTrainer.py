@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 
 from MeZOTrainer import MeZOTrainer
+from utils import option_logits
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +128,9 @@ class KFACMeZOTrainer(MeZOTrainer):
         attn = inputs.get("attention_mask")
         option_len = inputs["option_len"]
         num_options = inputs.get("num_options")
-        logits = model.original_forward(input_ids=input_ids, attention_mask=attn, use_cache=False).logits
-        shift_logits = logits[:, :-1, :].float()
-        shift_labels = input_ids[:, 1:].clone()
+        # only the option positions go through lm_head (always: long-context tasks would not fit in backprop otherwise)
+        shift_logits = option_logits(model, input_ids, attn, option_len).float()
+        shift_labels = input_ids[:, -shift_logits.size(1):].clone()
         mask = torch.zeros_like(shift_labels, dtype=torch.bool)
         for i, l in enumerate(option_len.tolist() if torch.is_tensor(option_len) else option_len):
             mask[i, -int(l):] = True
