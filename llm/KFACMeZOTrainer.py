@@ -101,6 +101,7 @@ class KFACMeZOTrainer(MeZOTrainer):
         self._calib_seconds_pending = 0.0
         self.restore_checks = []
         self.pg_abs = []
+        self.pg_decomp = []
         self._E = None
         self.kfac_identity = (args.kfac_power == 0.0)
 
@@ -388,6 +389,36 @@ class KFACMeZOTrainer(MeZOTrainer):
         return out
 
     @torch.no_grad()
+    def _pg_decompose(self, model, inputs):
+        """Diagnostic: two-point directional derivative along E restricted to subsets of the parameters, same batch and draw.
+        kfac = the K-FAC'd weights with this arm's E; rest = embeddings, positions, 1-D params (isotropic in every arm);
+        kfac_iso = the K-FAC'd weights with the isotropic z of the same seed. Needs the cached E. Restores by exact copy."""
+        assert self._E is not None and self.kfac is not None
+        eps = self.args.zo_eps
+        torch.manual_seed(self.zo_random_seed)
+        Z = [torch.normal(mean=0, std=1, size=p.data.size(), device=p.data.device, dtype=p.data.dtype) for _, p in self.named_parameters_to_optim]
+        items = list(zip(self.named_parameters_to_optim, self._E, Z))
+
+        def two_point(select):
+            chosen = [(p, d) for ((n, p), E, z) in items for d in [select(n, E, z)] if d is not None]
+            keep = [p.data for p, _ in chosen]
+            for (p, d), w in zip(chosen, keep):
+                p.data = w + eps * d
+            l1 = self.zo_forward(model, inputs).item()
+            for (p, d), w in zip(chosen, keep):
+                p.data = w - eps * d
+            l2 = self.zo_forward(model, inputs).item()
+            for (p, _), w in zip(chosen, keep):
+                p.data = w
+            return (l1 - l2) / (2 * eps)
+
+        self.pg_decomp.append({
+            "kfac": two_point(lambda n, E, z: E if n in self.kfac else None),
+            "rest": two_point(lambda n, E, z: E if n not in self.kfac else None),
+            "kfac_iso": two_point(lambda n, E, z: z if n in self.kfac else None),
+        })
+
+    @torch.no_grad()
     def _record_E_stats(self):
         """One-sample check of the normalization on the first step after a calibration (placement A: ||E||^2 / sum mn ~ 1)."""
         e2, mn, mx, per = 0.0, 0, 0.0, {}
@@ -425,6 +456,8 @@ class KFACMeZOTrainer(MeZOTrainer):
         self._E = self._draw() if self.args.kfac_cache_E else None
         if self._E is not None and self.kfac is not None and self.kfac_last_calib_step == self.state.global_step:
             self._record_E_stats()
+        if self.args.kfac_pg_decomp > 0 and len(self.pg_decomp) < self.args.kfac_pg_decomp:
+            self._pg_decompose(model, inputs)
 
         self.zo_perturb_parameters(scaling_factor=1)
         loss1 = self.zo_forward(model, inputs)
@@ -477,5 +510,8 @@ class KFACMeZOTrainer(MeZOTrainer):
                 "kfac_calibrations": self.kfac_calibs,
                 "kfac_calib_seconds_total": float(sum(c["seconds"] for c in self.kfac_calibs)),
                 "restore_checks": self.restore_checks,
+                "pg_decomp_rms": {k: float(np.sqrt(np.mean([r[k] ** 2 for r in self.pg_decomp]))) for k in ("kfac", "rest", "kfac_iso")} if self.pg_decomp else None,
+                "pg_decomp_n": len(self.pg_decomp),
+                "pg_full_rms": float(np.sqrt(np.mean(np.square(self.pg_abs)))) if self.pg_abs else None,
                 "projected_grad_abs_mean": float(np.mean(self.pg_abs)) if self.pg_abs else None,
                 "projected_grad_abs_median": float(np.median(self.pg_abs)) if self.pg_abs else None}

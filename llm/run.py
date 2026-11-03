@@ -89,6 +89,7 @@ class OurArguments(TrainingArguments):
     kfac_cache_E: bool = True  # materialize E once per step (+1x param memory) instead of regenerating 4x
     kfac_spectra_file: str = None  # where to write the factor spectra JSON (first calibration); default <output_dir>/kfac_spectra.json
     kfac_eigh_fp64: bool = True  # eigendecompose blocks in fp64
+    kfac_pg_decomp: int = 0  # if >0: on the first N steps split the directional derivative by parameter subset (diagnostic, 6 extra forwards)
     kfac_check_restore: int = 0  # if >0: on the first N steps record max|W_after_restore - W_before| (diagnostic)
 
     # [inverse-metric] LOREN port (LORENTrainer, trainer=loren); defaults from the released README/main.py
