@@ -97,7 +97,7 @@ python "$(dirname "$0")/../run.py" \
     --adam_eps 1e-6 \
     --max_time $MAX_TIME \
     --kfac_placement $KFAC_PLACEMENT --kfac_power $KFAC_POWER --kfac_damping $KFAC_DAMPING --kfac_block $KFAC_BLOCK \
-    --kfac_calib_steps $KFAC_CALIB_STEPS --kfac_calib_microbs $KFAC_CALIB_MICROBS --kfac_fisher $KFAC_FISHER \
+    --kfac_calib_steps $KFAC_CALIB_STEPS --kfac_calib_microbs $KFAC_CALIB_MICROBS --kfac_calib_max_tokens ${KFAC_CALIB_MAX_TOKENS:-1200} --kfac_fisher $KFAC_FISHER \
     --kfac_refresh $KFAC_REFRESH --kfac_cache_E $KFAC_CACHE_E \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
     --evaluation_strategy steps --save_strategy no --report_to ${REPORT_TO:-wandb} --run_name ${RUN_NAME:-$TAG} \

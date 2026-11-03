@@ -83,7 +83,8 @@ class OurArguments(TrainingArguments):
     kfac_block: int = 512  # block-diagonal block size for A and G
     kfac_calib_steps: int = 200  # backprop minibatches per calibration
     kfac_calib_bs: int = 16  # examples per calibration minibatch
-    kfac_calib_microbs: int = 16  # examples per backward pass (memory; exact accumulation)
+    kfac_calib_microbs: int = 16  # at most this many examples per backward pass
+    kfac_calib_max_tokens: int = 1200  # at most this many padded tokens per backward pass (one long example may exceed it)
     kfac_fisher: str = "true"  # "true": labels sampled from the model's predictive distribution; "empirical": gold labels
     kfac_refresh: int = 2000  # recompute factors every N ZO steps (0 = never)
     kfac_cache_E: bool = True  # materialize E once per step (+1x param memory) instead of regenerating 4x

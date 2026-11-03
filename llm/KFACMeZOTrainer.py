@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import RandomSampler
 
 from MeZOTrainer import MeZOTrainer
 from utils import option_logits
@@ -169,6 +169,29 @@ class KFACMeZOTrainer(MeZOTrainer):
             per_ex = (tok * mask).sum(-1) / mask.sum(-1).clamp(min=1)
             return per_ex.mean(), int(input_ids.size(0))
 
+    def _calib_groups(self, generator):
+        """kfac_calib_steps * kfac_calib_bs examples in sampler order, grouped into backward passes of at most kfac_calib_max_tokens
+        padded tokens (and kfac_calib_microbs examples). The statistics are sums, so grouping changes memory, not the result
+        beyond rounding. Backprop keeps ~3-4 MB per token at 1.3-1.5B, so long tasks cannot take a batch of 16 in one pass."""
+        args = self.args
+        total = args.kfac_calib_steps * args.kfac_calib_bs
+        ds = self.train_dataset
+        seen, cur, rows, maxlen = 0, [], 0, 0
+        while seen < total:
+            for i in RandomSampler(ds, generator=generator):
+                if seen >= total:
+                    break
+                item = ds[int(i)]
+                opts = item if isinstance(item, list) else [item]
+                r = len(opts)
+                L = int(math.ceil(max(len(o["input_ids"]) for o in opts) / 8) * 8)
+                if cur and ((rows + r) * max(maxlen, L) > args.kfac_calib_max_tokens or len(cur) >= args.kfac_calib_microbs):
+                    yield cur
+                    cur, rows, maxlen = [], 0, 0
+                cur.append(item); rows += r; maxlen = max(maxlen, L); seen += 1
+        if cur:
+            yield cur
+
     def kfac_calibrate(self, model):
         args = self.args
         t0 = time.time()
@@ -210,22 +233,12 @@ class KFACMeZOTrainer(MeZOTrainer):
         emb = model.get_input_embeddings()
         handles.append(emb.register_forward_hook(lambda m, i, o: ctx.__setitem__("emb", o)))
 
-        micro = max(1, min(args.kfac_calib_microbs, args.kfac_calib_bs))
-        n_micro = args.kfac_calib_steps * int(math.ceil(args.kfac_calib_bs / micro))
-        loader = DataLoader(self.train_dataset, batch_size=micro,
-                            sampler=RandomSampler(self.train_dataset, generator=g_cpu),
-                            collate_fn=self.data_collator, drop_last=False)
-        it = iter(loader)
         n_ex = 0
         model.eval()  # same mode as the ZO forward (no dropout)
         try:
             with torch.enable_grad():
-                for _ in range(n_micro):
-                    try:
-                        batch = next(it)
-                    except StopIteration:
-                        it = iter(loader); batch = next(it)
-                    batch = self._prepare_inputs(batch)
+                for batch_items in self._calib_groups(g_cpu):
+                    batch = self._prepare_inputs(self.data_collator(batch_items))
                     am = batch.get("attention_mask")
                     ctx["mask"] = am.bool() if am is not None else None
                     loss, nex = self._calib_loss(model, batch, g_dev)
@@ -238,6 +251,7 @@ class KFACMeZOTrainer(MeZOTrainer):
             for h in handles:
                 h.remove()
             model.eval()
+        torch.cuda.empty_cache()  # the autograd graphs are gone; give the eigensolver room
         torch.cuda.synchronize()
         t_stats = time.time() - t0
 
